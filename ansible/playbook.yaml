@@ -1,0 +1,338 @@
+---
+- name: Configure VictoriaMetrics storage
+  hosts: storage
+  become: true
+
+  tasks:
+    - name: Ensure storage directory exists
+      ansible.builtin.file:
+        path: /var/lib/vmstorage
+        state: directory
+        owner: victoriametrics
+        group: victoriametrics
+        mode: "0755"
+
+    - name: Configure vmstorage service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/vmstorage.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=VictoriaMetrics Storage
+          After=network.target
+
+          [Service]
+          User=victoriametrics
+          Group=victoriametrics
+          ExecStart=/usr/local/bin/vmstorage-prod -storageDataPath=/var/lib/vmstorage
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart vmstorage
+
+    - name: Start vmstorage
+      ansible.builtin.systemd:
+        name: vmstorage
+        daemon_reload: true
+        enabled: true
+        state: started
+
+  handlers:
+    - name: Restart vmstorage
+      ansible.builtin.systemd:
+        name: vmstorage
+        state: restarted
+        daemon_reload: true
+
+
+- name: Configure VictoriaMetrics ingestion
+  hosts: ingest
+  become: true
+
+  tasks:
+    - name: Create VictoriaMetrics user
+      ansible.builtin.user:
+        name: victoriametrics
+        system: true
+        shell: /usr/sbin/nologin
+
+    - name: Download cluster archive
+      ansible.builtin.get_url:
+        url: https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/v1.155.0/victoria-metrics-linux-amd64-v1.155.0-cluster.tar.gz
+        dest: /tmp/victoria-metrics.tar.gz
+        mode: "0644"
+
+    - name: Extract cluster binaries
+      ansible.builtin.unarchive:
+        src: /tmp/victoria-metrics.tar.gz
+        dest: /usr/local/bin
+        remote_src: true
+
+    - name: Configure vminsert service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/vminsert.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=VictoriaMetrics Insert
+          After=network.target
+
+          [Service]
+          User=victoriametrics
+          Group=victoriametrics
+          ExecStart=/usr/local/bin/vminsert-prod -storageNode=10.0.1.35:8400
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Start vminsert
+      ansible.builtin.systemd:
+        name: vminsert
+        daemon_reload: true
+        enabled: true
+        state: started
+
+
+- name: Configure VictoriaMetrics query and Grafana
+  hosts: query
+  become: true
+
+  tasks:
+    - name: Create VictoriaMetrics user
+      ansible.builtin.user:
+        name: victoriametrics
+        system: true
+        shell: /usr/sbin/nologin
+
+    - name: Download cluster archive
+      ansible.builtin.get_url:
+        url: https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/v1.155.0/victoria-metrics-linux-amd64-v1.155.0-cluster.tar.gz
+        dest: /tmp/victoria-metrics.tar.gz
+        mode: "0644"
+
+    - name: Extract cluster binaries
+      ansible.builtin.unarchive:
+        src: /tmp/victoria-metrics.tar.gz
+        dest: /usr/local/bin
+        remote_src: true
+
+    - name: Create vmselect cache directory
+      ansible.builtin.file:
+        path: /var/lib/vmselect-cache
+        state: directory
+        owner: victoriametrics
+        group: victoriametrics
+        mode: "0755"
+
+    - name: Configure vmselect service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/vmselect.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=VictoriaMetrics Select
+          After=network.target
+
+          [Service]
+          User=victoriametrics
+          Group=victoriametrics
+          ExecStart=/usr/local/bin/vmselect-prod -storageNode=10.0.1.35:8401 -cacheDataPath=/var/lib/vmselect-cache
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Start vmselect
+      ansible.builtin.systemd:
+        name: vmselect
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Install Grafana prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - wget
+          - gnupg
+        state: present
+        update_cache: true
+
+    - name: Add Grafana signing key
+      ansible.builtin.get_url:
+        url: https://apt.grafana.com/gpg.key
+        dest: /etc/apt/keyrings/grafana.asc
+        mode: "0644"
+      register: grafana_key
+
+    - name: Add Grafana repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/grafana.asc] https://apt.grafana.com stable main"
+        filename: grafana
+        state: present
+
+    - name: Install Grafana
+      ansible.builtin.apt:
+        name: grafana
+        state: present
+        update_cache: true
+
+    - name: Configure VictoriaMetrics datasource
+      ansible.builtin.copy:
+        dest: /etc/grafana/provisioning/datasources/victoriametrics.yml
+        mode: "0644"
+        content: |
+          apiVersion: 1
+          datasources:
+            - name: VictoriaMetrics
+              type: prometheus
+              access: proxy
+              url: http://127.0.0.1:8481/select/0/prometheus
+              isDefault: true
+              editable: true
+      notify: Restart Grafana
+
+    - name: Start Grafana
+      ansible.builtin.systemd:
+        name: grafana-server
+        daemon_reload: true
+        enabled: true
+        state: started
+
+  handlers:
+    - name: Restart Grafana
+      ansible.builtin.systemd:
+        name: grafana-server
+        state: restarted
+
+- name: Install node exporter on all servers
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Download node exporter
+      ansible.builtin.get_url:
+        url: https://github.com/prometheus/node_exporter/releases/download/v1.9.1/node_exporter-1.9.1.linux-amd64.tar.gz
+        dest: /tmp/node_exporter.tar.gz
+        mode: "0644"
+
+    - name: Extract node exporter
+      ansible.builtin.unarchive:
+        src: /tmp/node_exporter.tar.gz
+        dest: /tmp
+        remote_src: true
+
+    - name: Install node exporter binary
+      ansible.builtin.copy:
+        src: /tmp/node_exporter-1.9.1.linux-amd64/node_exporter
+        dest: /usr/local/bin/node_exporter
+        remote_src: true
+        mode: "0755"
+
+    - name: Configure node exporter service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/node-exporter.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Prometheus Node Exporter
+          After=network.target
+
+          [Service]
+          ExecStart=/usr/local/bin/node_exporter
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Start node exporter
+      ansible.builtin.systemd:
+        name: node-exporter
+        daemon_reload: true
+        enabled: true
+        state: started
+
+
+- name: Configure vmagent on query server
+  hosts: query
+  become: true
+
+  tasks:
+- name: Configure vmagent on query server
+  hosts: query
+  become: true
+
+  tasks:
+
+    - name: Download vmutils archive
+      ansible.builtin.get_url:
+        url: https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/v1.155.0/vmutils-linux-amd64-v1.155.0.tar.gz
+        dest: /tmp/vmutils.tar.gz
+        mode: "0644"
+
+    - name: Extract vmutils binaries
+      ansible.builtin.unarchive:
+        src: /tmp/vmutils.tar.gz
+        dest: /usr/local/bin
+        remote_src: true
+
+
+    - name: Verify vmagent binary exists
+      ansible.builtin.stat:
+        path: /usr/local/bin/vmagent-prod
+      register: vmagent_binary
+
+    - name: Stop if vmagent binary is missing
+      ansible.builtin.fail:
+        msg: "vmagent-prod binary archive mein nahi mili."
+      when: not vmagent_binary.stat.exists
+
+    - name: Create vmagent configuration directory
+      ansible.builtin.file:
+        path: /etc/vmagent
+        state: directory
+        mode: "0755"
+
+    - name: Configure metrics scraping
+      ansible.builtin.copy:
+        dest: /etc/vmagent/scrape.yml
+        mode: "0644"
+        content: |
+          global:
+            scrape_interval: 15s
+
+          scrape_configs:
+            - job_name: node
+              static_configs:
+                - targets:
+                    - 10.0.1.35:9100
+                    - 10.0.1.171:9100
+                    - 10.0.1.249:9100
+                    - 10.0.1.110:9100
+
+    - name: Configure vmagent service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/vmagent.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=VictoriaMetrics Agent
+          After=network.target
+
+          [Service]
+          ExecStart=/usr/local/bin/vmagent-prod -promscrape.config=/etc/vmagent/scrape.yml -remoteWrite.url=http://10.0.1.171:8480/insert/0/prometheus/api/v1/write
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Start vmagent
+      ansible.builtin.systemd:
+        name: vmagent
+        daemon_reload: true
+        enabled: true
+        state: restarted
+
